@@ -417,25 +417,46 @@ if selected_numeric_cols:
                 )
             )
         
-            # 🔸 加上品牌 Logo
+            # 🔸 加上品牌 Logo 或品牌名稱（若無 logo）
             for _, row in chart_data.iterrows():
                 x_anchor = row["x_label"]
                 品牌名 = row["品牌"]
                 logo_path = 品牌_logos.get(品牌名)
-                if logo_path and os.path.exists(logo_path):
-                    img = Image.open(logo_path)
-                    fig.add_layout_image(dict(
-                        source=img,
-                        x=x_anchor,
-                        y=logo_y_offset,
-                        xref="x",
-                        yref="paper",
-                        sizex=1,
-                        sizey=logo_sizey,
-                        xanchor="center",
-                        yanchor="top",
-                        layer="above"
-                    ))
+            
+                try:
+                    if logo_path and os.path.exists(logo_path):
+                        img = Image.open(logo_path)
+                        fig.add_layout_image(dict(
+                            source=img,
+                            x=x_anchor,
+                            y=logo_y_offset,
+                            xref="x",
+                            yref="paper",
+                            sizex=1,
+                            sizey=logo_sizey,
+                            xanchor="center",
+                            yanchor="top",
+                            layer="above"
+                        ))
+                    else:
+                        # 顯示品牌名稱文字（取代 logo）
+                        fig.add_annotation(
+                            x=x_anchor,
+                            y=logo_y_offset,
+                            xref="x",
+                            yref="paper",
+                            text=f"<b>{品牌名}</b>",
+                            showarrow=False,
+                            font=dict(size=12, color="gray"),
+                            align="center",
+                            xanchor="center",
+                            yanchor="top"
+                        )
+                except Exception:
+                    # 即使錯誤也跳過，不報錯
+                    pass
+
+
         
             # 🔸 加上產品圖片
             for _, row in chart_data.iterrows():
