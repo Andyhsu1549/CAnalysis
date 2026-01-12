@@ -1,728 +1,1237 @@
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
-from PIL import Image
-import os
-import requests
-import base64
-from io import BytesIO
-import numpy as np
-import openai
-from openai import OpenAI
-import time
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Image as RLImage, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfbase import pdfmetrics
-from reportlab.lib import colors
-import html
+from datetime import datetime, date, time
+from pathlib import Path
 
-# 使用 secrets 或環境變數
-api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+# ========================
+# 基礎設定與共用函式
+# ========================
 
-client = OpenAI(api_key=api_key)
+DATA_DIR = Path("data")
+UPLOAD_DIR = Path("uploads")
+ASSETS_DIR = Path("assets")
 
-def ask_chatgpt_with_history(user_input):
-    st.session_state["chat_history"].append({"role": "user", "content": user_input})
-
-    response = client.chat.completions.create(
-        model="gpt-4",
-        messages=st.session_state["chat_history"],
-        temperature=0.3
-    )
-
-    reply = response.choices[0].message.content.strip()
-    st.session_state["chat_history"].append({"role": "assistant", "content": reply})
-    return reply
-
-# 去白底函數
-def remove_white_background(img):
-    img = img.convert("RGBA")
-    data = np.array(img)
-    r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
-    white_threshold = 240
-    mask = (r > white_threshold) & (g > white_threshold) & (b > white_threshold)
-    data[mask] = [255, 255, 255, 0]
-    return Image.fromarray(data)
-
-# 統一尺寸函數
-def resize_with_padding(img, target_size=(500, 500)):
-    img = img.convert("RGBA")
-    old_size = img.size
-    ratio = min(target_size[0] / old_size[0], target_size[1] / old_size[1])
-    new_size = (int(old_size[0] * ratio), int(old_size[1] * ratio))
-    img = img.resize(new_size, Image.LANCZOS)
-    new_img = Image.new("RGBA", target_size, (255, 255, 255, 0))
-    paste_position = ((target_size[0] - new_size[0]) // 2, (target_size[1] - new_size[1]) // 2)
-    new_img.paste(img, paste_position)
-    return new_img
-
-# ChatGPT - 單輪分析
-def ask_chatgpt(prompt):
-    openai.api_key = api_key
-    response = openai.ChatCompletion.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message["content"]
+for d in [DATA_DIR, UPLOAD_DIR, ASSETS_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
 
 
-# 多行文字換行工具
-def wrap_multiline(text: str, width: int) -> str:
-    if not isinstance(text, str):
-        text = str(text)
-    return "<br>".join([text[i:i+width] for i in range(0, len(text), width)]) if len(text) > width else text
-
-# 頁面設定
-st.set_page_config(page_title="INTENZA 競品分析工具", layout="wide")
-st.title("💡 INTENZA 競品分析數位化轉型工具")
-
-# 安全初始化
-selected_numeric_cols = []
-selected_text_cols = []
-chart_type_map = {}
-sort_order = "固定"  # 預設值
-
-
-
-with st.sidebar.expander("📂 請上傳 CSV 檔案", expanded=False):
-    uploaded_file = st.file_uploader("上傳", type=["csv"], label_visibility="collapsed")
-
-
-if uploaded_file is not None:
-    # 嘗試讀取 CSV，用多種編碼
-    encodings = ["utf-8", "big5", "cp950", "utf-16", "iso-8859-1"]
-    for enc in encodings:
-        try:
-            df = pd.read_csv(uploaded_file, encoding=enc)
-            st.success(f"✅ 成功使用編碼：{enc}")
-            break
-        except UnicodeDecodeError:
-            continue
+def load_csv(name: str, columns: list) -> pd.DataFrame:
+    """讀取 CSV，如不存在則建立空 DataFrame。"""
+    path = DATA_DIR / name
+    if path.exists():
+        df = pd.read_csv(path)
     else:
-        st.error("❌ 無法讀取 CSV，請確認檔案編碼格式（建議另存為 UTF-8）")
-        st.stop()
-        
-    # 強制轉字串
-    if "品牌" in df.columns:
-        df["品牌"] = df["品牌"].astype(str)
-    if "產品型號" in df.columns:
-        df["產品型號"] = df["產品型號"].astype(str)
+        df = pd.DataFrame(columns=columns)
+    return df
 
 
-    with st.expander("📄 原始資料表格（點擊展開/收合）", expanded=False):
-        st.dataframe(df, use_container_width=True)
-
-    numeric_columns = df.select_dtypes(include=['float64', 'int64']).columns.tolist()
-    non_numeric_columns = df.select_dtypes(exclude=['float64', 'int64']).columns.tolist()
-    
-    # 🔰 防止後續報錯：預設初始化
-    selected_numeric_cols = []
-    selected_text_cols = []
+def save_csv(name: str, df: pd.DataFrame):
+    """儲存 DataFrame 到 CSV。"""
+    path = DATA_DIR / name
+    df.to_csv(path, index=False)
 
 
-    品牌_fix_map = {"LifeFitness": "Life Fitness", "TRUE": "True Fitness", "VISION": "Vision Fitness"}
-    df["品牌"] = df["品牌"].replace(品牌_fix_map)
+# ========================
+# 附件管理通用區塊
+# ========================
 
-    品牌_logos = {
-        "Life Fitness": "logos/LF.jpg",
-        "Matrix": "logos/matrix.jpg",
-        "Precor": "logos/PRECOR.jpg",
-        "Technogym": "logos/TG.jpg",
-        "True Fitness": "logos/true.jpg",
-        "Vision Fitness": "logos/VISON.jpg"
-    }
-
-    df["label"] = df["產品型號"]
-    # 生成選項清單
-    # 全部品牌與機型選項
-    model_options = (df["品牌"] + " - " + df["產品型號"]).drop_duplicates().tolist()
-    max_models = 10
-    
-   # ➤ 品牌與機型選擇（最多 10 個）
-    st.sidebar.header("⚙️ 比較設定")
-    st.sidebar.markdown("🏷️ **品牌與機型選擇**")
-    
-    model_options = (df["品牌"] + " - " + df["產品型號"]).drop_duplicates().tolist()
-    max_models = 10
-    
-    # 初始化狀態
-    if "selected_models" not in st.session_state:
-        st.session_state["selected_models"] = []
-    
-    if "model_select_mode" not in st.session_state:
-        st.session_state["model_select_mode"] = "manual"
-    
-    # 選擇方式切換（手動 or 全選）
-    select_mode = st.sidebar.radio(
-        "選擇模式",
-        ["手動選擇", "一鍵全選"],
-        index=0,
-        key="select_mode_toggle"
-    )
-    
-    # ⬇️ 使用者選擇後對應行為
-    if select_mode == "一鍵全選" and st.session_state["model_select_mode"] != "auto":
-        st.session_state["selected_models"] = model_options[:max_models]
-        st.session_state["model_select_mode"] = "auto"
-    
-    elif select_mode == "手動選擇":
-        manual_selected = st.sidebar.multiselect(
-            f"選擇品牌與機型（最多 {max_models} 個）",
-            model_options,
-            default=st.session_state["selected_models"],
-            max_selections=max_models,
-            key="model_multiselect"
-        )
-        st.session_state["selected_models"] = manual_selected
-        st.session_state["model_select_mode"] = "manual"
-    
-    # 最終選擇結果
-    selected_models = st.session_state["selected_models"]
-    
-    # ✅ 視覺強化顯示已選品牌與機型
-    if selected_models:
-        st.sidebar.markdown("✅ **目前選擇的品牌與機型：**")
-        selected_html = """
-        <style>
-        .selected-list {
-            background-color:#f0f4f8;
-            padding:12px;
-            border-radius:10px;
-            border:1px solid #d0d0d0;
-            margin-top:10px;
-            margin-bottom:20px;
-        }
-        .selected-item {
-            font-size:14px;
-            color:#c23b3b;
-            margin-bottom:10px;
-            padding-left:1.4em;
-            position: relative;
-            line-height: 1.6;
-            word-break: break-word;
-        }
-        .selected-item::before {
-            content: '•';
-            position: absolute;
-            left: 0;
-            top: 0;
-            color: #333;
-        }
-        </style>
-        <div class="selected-list">
-        """
-        
-        for item in selected_models:
-            selected_html += f"<div class='selected-item'><b>{item}</b></div>"
-        
-        selected_html += "</div>"
-        st.sidebar.markdown(selected_html, unsafe_allow_html=True)
+def _simple_type_from_mime(mime: str) -> str:
+    if not mime:
+        return "other"
+    if mime.startswith("image"):
+        return "image"
+    if mime.startswith("video"):
+        return "video"
+    if mime == "application/pdf":
+        return "pdf"
+    return "other"
 
 
-    
-    # ➤ 🎨 品牌顏色設定（只針對已選品牌）
-    selected_品牌s = list(set([x.split(" - ")[0] for x in selected_models]))
-    brand_color_map = {}
-    
+def _preview_file(path: str, file_type: str):
+    """依檔案類型，在畫面中預覽或提供下載。"""
+    try:
+        p = Path(path)
+        if not p.exists():
+            st.warning(f"檔案不存在：{path}")
+            return
 
-
-    st.sidebar.markdown("🎨 **品牌顏色設定**")
-    default_colors = [
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
-        "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
-        "#bcbd22", "#17becf"
-    ]
-    
-    for i, brand in enumerate(selected_品牌s):
-        brand_color_map[brand] = st.sidebar.color_picker(
-            f"{brand} 顏色",
-            value=default_colors[i % len(default_colors)],
-            key=f"{brand}_color"
-        )
-
-
-
-
-    st.sidebar.markdown("📈 **數值欄位選擇**")
-    select_all_numeric = st.sidebar.checkbox("全選", key="select_all_numeric_cols")
-    
-    if select_all_numeric:
-        selected_numeric_cols = numeric_columns  # 全部選擇
-    else:
-        selected_numeric_cols = st.sidebar.multiselect(
-            "選擇要比較的欄位（可多選）",
-            numeric_columns,
-            default=numeric_columns[:1]
-        )
-
-
-    num_products = len(selected_models)
-
-chart_type_map = {}
-if selected_numeric_cols:
-    with st.sidebar.expander("📐 圖表類型設定", expanded=True):
-        for col in selected_numeric_cols:
-            chart_type_map[col] = st.selectbox(
-                f"圖表類型 - {col}",
-                ["長條圖（Bar）", "折線圖（Line）", "散點圖（Scatter）", "圓餅圖（Pie）"],
-                key=f"{col}_chart"
-            )
-
-    # ✅ 圖表排序邏輯（請放在迴圈之外，只做一次）
-    st.sidebar.markdown("🔽 **圖表排序方式**")
-    sort_order = st.sidebar.radio(
-        "選擇排序邏輯",
-        ["固定", "由小到大", "由大到小"],
-        index=0,
-        key="sort_order_radio"
-    )
-
-
-
-
-
-
-    
-    # 圖表與圖片樣式設定
-    # 固定圖表樣式參數（取代原本側邊欄）
-    chart_width = 1400
-    chart_height = 700
-    margin_top = 80
-    margin_right = 50
-    margin_bottom = 225
-    margin_left = 50
-    
-    logo_sizey = 0.17
-    logo_y_offset = -0.33
-    
-    product_img_sizey = 0.22
-    product_img_y_offset = -0.40
-    
-    x_label_display = "多行"  # 可改為 "水平" 或 "斜角（-45°）"
-    wrap_width = 12
-    x_tick_font_size = 8
-
-
-    # 非數值欄位全選邏輯
-    st.sidebar.write("📋 其他類別欄位選擇")
-    all_text_cols = [col for col in non_numeric_columns if col not in ['品牌', '產品型號', 'label', '圖片網址']]
-    select_all = st.sidebar.checkbox("全選", key="select_all_text_fields")
-    if select_all:
-        selected_text_cols = st.sidebar.multiselect("選擇欄位", all_text_cols, default=all_text_cols)
-    else:
-        selected_text_cols = st.sidebar.multiselect("選擇欄位", all_text_cols)
-
-    chart_width, chart_height, bottom_margin = 900, 500, 170
-    logo_sizey, logo_y_offset, product_img_sizey, product_img_y_offset = 0.14, -0.10, 0.30, -0.33
-
-    if selected_models:
-        selected_品牌s = [x.split(" - ")[0] for x in selected_models]
-        selected_products = [x.split(" - ")[1] for x in selected_models]
-        filtered_df = df[df["品牌"].isin(selected_品牌s) & df["產品型號"].isin(selected_products)].drop_duplicates(subset=["品牌", "產品型號"])
-        
-
-        for col in selected_numeric_cols:
-            chart_data = filtered_df[["label", "品牌", "產品型號", col, "圖片網址"]].copy()
-            chart_data[col] = chart_data[col].fillna(0)
-        
-            # ✅ 🔽 在這裡加上排序邏輯
-            if sort_order == "由小到大":
-                chart_data = chart_data.sort_values(by=col, ascending=True)
-            elif sort_order == "由大到小":
-                chart_data = chart_data.sort_values(by=col, ascending=False)
-
-        
-            # 顯示用 x_label（可換行）
-            if x_label_display == "多行":
-                chart_data["x_label"] = chart_data["label"].apply(lambda s: wrap_multiline(s, wrap_width))
-                tickangle = 0
-            elif x_label_display == "斜角（-45°）":
-                chart_data["x_label"] = chart_data["label"]
-                tickangle = -45
-            else:
-                chart_data["x_label"] = chart_data["label"]
-                tickangle = 0
-        
-            st.subheader(f"📊 【{col}】比較圖（共 {len(chart_data)} 筆）")
-            chart_type = chart_type_map.get(col, "長條圖（Bar）")
-        
-            # 🔸 Pie Chart
-            if chart_type == "圓餅圖（Pie）":
-                fig = go.Figure(data=[go.Pie(
-                    labels=chart_data["label"],
-                    values=chart_data[col],
-                    textinfo='label+percent',
-                    hoverinfo='label+value+percent',
-                    hole=0.3
-                )])
-                fig.update_layout(
-                    width=chart_width,
-                    height=chart_height,
-                    margin=dict(t=40, b=40, l=40, r=40),
-                    title=dict(text=f"{col} 的比例分析", x=0.5, font=dict(size=20)),
-                    showlegend=True
+        if file_type == "image":
+            st.image(str(p))
+        elif file_type == "video":
+            st.video(str(p))
+        elif file_type == "pdf":
+            with open(p, "rb") as f:
+                st.download_button(
+                    "下載 PDF",
+                    data=f,
+                    file_name=p.name,
+                    mime="application/pdf",
                 )
-                st.plotly_chart(fig, use_container_width=True)
-                continue
-        
-            # 🔸 Bar / Line / Scatter
-            fig = go.Figure()
-            for 品牌 in chart_data["品牌"].unique():
-                subset = chart_data[chart_data["品牌"] == 品牌]
-                if chart_type == "長條圖（Bar）":
-                    fig.add_trace(go.Bar(
-                        x=subset["x_label"],
-                        y=subset[col],
-                        name=品牌,
-                        marker_color=brand_color_map.get(品牌, None),  # ✅ 指定顏色
-                        text=subset[col],
-                        textposition='outside',
-                        textfont=dict(size=11),
-                        cliponaxis=False  # 讓文字不被邊界截掉
-                    ))
-                elif chart_type == "折線圖（Line）":
-                    fig.add_trace(go.Scatter(
-                        x=subset["x_label"],
-                        y=subset[col],
-                        mode='lines+markers+text',
-                        name=品牌,
-                        marker_color=brand_color_map.get(品牌, None),  # ✅ 指定顏色
-                        text=subset[col],
-                        textposition='top center',
-                        textfont=dict(size=11)
-                    ))
-                elif chart_type == "散點圖（Scatter）":
-                    fig.add_trace(go.Scatter(
-                        x=subset["x_label"],
-                        y=subset[col],
-                        mode='markers+text',
-                        name=品牌,
-                        marker_color=brand_color_map.get(品牌, None),  # ✅ 指定顏色
-                        text=subset[col],
-                        textposition='top center',
-                        textfont=dict(size=11)
-                    ))
-        
-            fig.update_layout(
-                width=chart_width,
-                height=chart_height,
-                margin=dict(l=margin_left, r=margin_right, t=margin_top, b=margin_bottom),
-                xaxis=dict(
-                    tickangle=tickangle,
-                    tickfont=dict(size=x_tick_font_size),
-                    categoryorder="array",
-                    categoryarray=chart_data["x_label"].tolist()
+        else:
+            with open(p, "rb") as f:
+                st.download_button(
+                    "下載檔案",
+                    data=f,
+                    file_name=p.name,
                 )
-            )
-        
-            # 🔸 加上品牌 Logo 或品牌名稱（若無 logo）
-            for _, row in chart_data.iterrows():
-                x_anchor = row["x_label"]
-                品牌名 = row["品牌"]
-                logo_path = 品牌_logos.get(品牌名)
-            
-                try:
-                    if logo_path and os.path.exists(logo_path):
-                        img = Image.open(logo_path)
-                        fig.add_layout_image(dict(
-                            source=img,
-                            x=x_anchor,
-                            y=logo_y_offset,
-                            xref="x",
-                            yref="paper",
-                            sizex=1,
-                            sizey=logo_sizey,
-                            xanchor="center",
-                            yanchor="top",
-                            layer="above"
-                        ))
-                    else:
-                        # 顯示品牌名稱文字（取代 logo）
-                        fig.add_annotation(
-                            x=x_anchor,
-                            y=logo_y_offset,
-                            xref="x",
-                            yref="paper",
-                            text=f"<b>{品牌名}</b>",
-                            showarrow=False,
-                            font=dict(size=12, color="gray"),
-                            align="center",
-                            xanchor="center",
-                            yanchor="top"
-                        )
-                except Exception:
-                    # 即使錯誤也跳過，不報錯
-                    pass
+    except Exception as e:
+        st.error(f"預覽檔案時發生錯誤：{e}")
 
 
-        
-            # 🔸 加上產品圖片
-            for _, row in chart_data.iterrows():
-                x_anchor = row["x_label"]
-                img_url = row["圖片網址"]
-                if isinstance(img_url, str) and img_url.startswith("http"):
-                    try:
-                        img = Image.open(BytesIO(requests.get(img_url).content))
-                        img = remove_white_background(img)
-                        img = resize_with_padding(img)
-                        buffer = BytesIO()
-                        img.save(buffer, format="PNG")
-                        img_base64 = f"data:image/png;base64,{base64.b64encode(buffer.getvalue()).decode()}"
-                        fig.add_layout_image(dict(
-                            source=img_base64,
-                            x=x_anchor,
-                            y=product_img_y_offset,
-                            xref="x",
-                            yref="paper",
-                            sizex=1,
-                            sizey=product_img_sizey,
-                            xanchor="center",
-                            yanchor="top",
-                            layer="above"
-                        ))
-                    except:
-                        pass
-        
-            st.plotly_chart(fig, use_container_width=True)
-
-
-
-
-        st.write("")
-        st.write("")
-        st.write("")
-        st.subheader("📋 非數值規格比較表格")
-        
-        # 重組資料
-        filtered_df = filtered_df.reset_index(drop=True)
-        transposed_data = []
-        for spec in selected_text_cols:
-            row = [spec]
-            for _, product_row in filtered_df.iterrows():
-                row.append(product_row[spec])
-            transposed_data.append(row)
-        
-        # 表頭兩層
-        brand_row = [""] + [row["品牌"] for _, row in filtered_df.iterrows()]
-        model_row = ["規格名稱"] + [row["產品型號"] for _, row in filtered_df.iterrows()]
-        
-        st.markdown(f"""
-        <style>
-        .custom-table-container {{
-            width: {chart_width}px;
-            margin-left: auto;
-            margin-right: auto;
-        }}
-        
-        @media print {{
-        
-            .custom-table-container {{
-                width: 100% !important;
-            }}
-        
-            .plotly-graph-div {{
-                width: 100% !important;
-                max-width: 100% !important;
-            }}
-        
-            .stApp {{
-                width: 100% !important;
-                max-width: 100% !important;
-                overflow: visible !important;
-            }}
-        
-            img {{
-                max-width: 100% !important;
-                height: auto !important;
-            }}
-        }}
-        </style>
-        """, unsafe_allow_html=True)
-
-
-        
-        # 組出 HTML 表格
-        html_table = f"""
-        <style>
-        .custom-table-container {{
-            width: {chart_width}px;
-            margin-left: auto;
-            margin-right: auto;
-        }}
-        .custom-table {{
-            border-collapse: collapse;
-            width: 100%;
-            table-layout: fixed;
-        }}
-        .custom-table th, .custom-table td {{
-            border: none;
-            padding: 8px;
-            text-align: center;
-            word-wrap: break-word;
-            font-size: 14px;
-        }}
-        .custom-table th:first-child, .custom-table td:first-child {{
-            width: 100px;
-            color: rgb(245,245,245);
-            font-weight: bold;
-        }}
-        .custom-table th {{
-            color: rgb(188,188,188);
-            font-weight: bold;
-            background-color: transparent;
-        }}
-        .custom-table td {{
-            color: rgb(188,188,188);
-            background-color: transparent;
-        }}
-        </style>
-        <div class="custom-table-container">
-        <table class="custom-table">
-        <thead>
-        <tr>
-        """
-        
-        # 第一層：品牌
-        for col in brand_row:
-            html_table += f"<th>{col}</th>"
-        html_table += "</tr><tr>"
-        
-        # 第二層：型號
-        for col in model_row:
-            html_table += f"<th>{col}</th>"
-        html_table += "</tr></thead><tbody>"
-        
-        # 資料內容
-        for row in transposed_data:
-            html_table += "<tr>"
-            for cell in row:
-                display = "-" if pd.isna(cell) or cell == "" else cell
-                html_table += f"<td>{display}</td>"
-            html_table += "</tr>"
-        
-        html_table += "</tbody></table></div>"
-        
-        st.markdown(html_table, unsafe_allow_html=True)
-
-
-
-
-if uploaded_file is not None and selected_models and (selected_numeric_cols or selected_text_cols):
-
-    st.write("---")
-    st.subheader("🤖 ChatGPT 自動分析")
-
-    compare_cols = ["品牌", "產品型號"] + selected_numeric_cols + selected_text_cols
-    compare_df = filtered_df[compare_cols]
-
-    if "gpt_response" not in st.session_state:
-        st.session_state["gpt_response"] = ""
-
-    if st.button("請 ChatGPT 總結這次的比較結果"):
-        prompt = f"""
-以下為健身器材競品詳細比較資料，請依據資料客觀整理內容，並模擬專業報告或高端品牌型錄的視覺層次與排版節奏，具體規則如下：
-
-請僅輸出乾淨、結構清晰的 HTML 片段，嚴格遵循以下規範：
-
-【數值型規格分析】
-請使用 <table> 表格結構，欄位依序為：
-- 規格名稱
-- 數值範圍（最小值 ~ 最大值）
-- 具有最大值之品牌與型號
-- 具有最小值之品牌與型號
-
-【文字描述類規格分析】
-每個規格：
-- 使用 <h2> 作為規格標題
-- 差異描述部分，請使用條列 <ul><li> 或簡短段落 <p> 呈現
-
-【SWOT 分析】
-每個產品請依以下格式呈現：
-<h3>[產品名稱] 產品 SWOT 分析</h3>
-<table>
-<tr><th>面向</th><th>說明</th></tr>
-<tr><td>優勢</td><td>…</td></tr>
-<tr><td>劣勢</td><td>…</td></tr>
-<tr><td>機會</td><td>…</td></tr>
-<tr><td>威脅</td><td>…</td></tr>
-</table>
-
-【競爭力規格設計建議】
-請條列具體建議，重要詞彙使用 <b> 加粗，並且若是涉及有參數的規格，給出相關參數的建議。
-
-補充規定：
-- 僅使用 <h1>、<h2>、<h3>、<table>、<tr>、<th>、<td>、<p>、<ul>、<li>、<b>
-- 嚴禁輸出 <html>、<head>、<body>、<!DOCTYPE html> 等外層結構
-- 嚴禁符號轉義，保留標籤原樣
-- 全程繁體中文，內容簡潔利於閱讀
-
-以下為本次重點規格：
-{', '.join(selected_numeric_cols + selected_text_cols)}
-
-資料如下：
-{compare_df.to_string(index=False)}
-"""
-
-        with st.spinner("分析中..."):
-            summary = ask_chatgpt(prompt)
-        st.session_state["gpt_response"] = summary
-
-        # ✅ 自動加入對話歷程
-        if "chat_history" not in st.session_state:
-            st.session_state["chat_history"] = [
-                {"role": "system", "content": "你是專業的健身器材競品分析顧問。請根據使用者提問，給出邏輯清楚、語氣穩重的回覆。"}
-            ]
-
-        existing_contents = [m["content"] for m in st.session_state["chat_history"] if m["role"] == "assistant"]
-        if summary not in existing_contents:
-            st.session_state["chat_history"].append({"role": "assistant", "content": summary})
-
-    custom_css = """
-    <style>
-    h1 { font-size: 34px; font-weight: bold; }
-    h2 { font-size: 26px; font-weight: bold; }
-    h3 { font-size: 22px; font-weight: bold; }
-    p  { font-size: 16px; line-height: 1.6; }
-    b  { font-weight: bold; color: #d9534f; }
-    </style>
+def attachment_section(module: str, ref_df: pd.DataFrame,
+                       ref_label_col: str, ref_id_col: str = "id"):
     """
-    st.markdown(custom_css, unsafe_allow_html=True)
+    通用附件區塊：
+    - module: 字串，標示是哪個模組（site/script/department/schedule/editing...）
+    - ref_df: 主資料 DataFrame
+    - ref_label_col: 在下拉選單顯示的欄位
+    - ref_id_col: 主鍵欄位名稱，預設 "id"
+    """
+    st.markdown("### 相關附件")
 
-    if st.session_state["gpt_response"]:
-        clean_text = st.session_state["gpt_response"]
-        if clean_text.startswith("html\n"):
-            clean_text = clean_text[len("html\n"):]
-        st.markdown(clean_text, unsafe_allow_html=True)
+    attachments = load_csv(
+        "attachments.csv",
+        [
+            "id",
+            "module",
+            "ref_id",
+            "title",
+            "file_name",
+            "file_path",
+            "file_type",
+            "uploaded_at",
+            "note",
+        ],
+    )
 
-    st.write("---")
-    st.subheader("💬 ChatGPT 自由提問")
+    if ref_df.empty:
+        st.info("目前沒有可關聯的資料，請先新增一筆主資料。")
+        return
 
-    user_question = st.text_input("請輸入您的問題")
-    if st.button("送出問題"):
-        if user_question.strip():
-            with st.spinner("回覆中..."):
-                answer = ask_chatgpt_with_history(user_question)
-                st.session_state["chat_history"].append({"role": "user", "content": user_question})
-                st.session_state["chat_history"].append({"role": "assistant", "content": answer})
-                st.markdown(answer, unsafe_allow_html=True)
+    # 選擇要管理哪一筆主資料
+    options = {
+        f"{row[ref_label_col]} (ID: {int(row[ref_id_col])})": int(row[ref_id_col])
+        for _, row in ref_df.iterrows()
+    }
+    selected_label = st.selectbox(
+        "選擇一筆資料來管理附件",
+        list(options.keys()),
+        key=f"attach_select_{module}",
+    )
+    selected_id = options[selected_label]
 
-    if st.button("🧹 清除對話歷程"):
-        st.session_state.pop("chat_history", None)
-        st.rerun()
+    # 上傳附件
+    st.subheader("上傳新附件")
+    with st.form(f"upload_form_{module}", clear_on_submit=True):
+        title = st.text_input("附件名稱/說明", key=f"title_{module}")
+        files = st.file_uploader(
+            "選擇檔案（可多選）",
+            accept_multiple_files=True,
+            type=None,
+            key=f"files_{module}",
+        )
+        note = st.text_area("備註（選填）", height=60, key=f"note_{module}")
+        submitted = st.form_submit_button("上傳附件")
 
-    if "chat_history" in st.session_state:
-        with st.expander("📜 查看對話歷程", expanded=False):
-            for msg in st.session_state["chat_history"]:
-                if msg["role"] in ["user", "assistant"]:
-                    speaker = "👤 使用者" if msg["role"] == "user" else "🤖 ChatGPT"
-                    st.markdown(f"**{speaker}:** {msg['content']}")
+        if submitted and files:
+            module_dir = UPLOAD_DIR / module
+            module_dir.mkdir(parents=True, exist_ok=True)
 
-elif uploaded_file is not None:
-    # ✅ 避免錯誤提示：已上傳但還沒選擇品牌或欄位
-    st.warning("請至少選擇一個品牌與機型，並選擇至少一個規格欄位來進行分析。")
+            for f in files:
+                file_path = module_dir / f.name
+                with open(file_path, "wb") as out:
+                    out.write(f.getbuffer())
 
-else:
-    # ✅ 尚未上傳檔案
-    st.info("請上傳 CSV 檔案以開始。")
+                new_id = attachments["id"].max() + 1 if len(attachments) > 0 else 1
+                file_type = _simple_type_from_mime(f.type)
+
+                new_row = {
+                    "id": new_id,
+                    "module": module,
+                    "ref_id": selected_id,
+                    "title": title or f.name,
+                    "file_name": f.name,
+                    "file_path": str(file_path),
+                    "file_type": file_type,
+                    "uploaded_at": datetime.now().isoformat(),
+                    "note": note,
+                }
+                attachments = pd.concat(
+                    [attachments, pd.DataFrame([new_row])],
+                    ignore_index=True,
+                )
+
+            save_csv("attachments.csv", attachments)
+            st.success("附件已上傳")
+
+    # 附件列表與預覽
+    st.subheader("附件列表與預覽")
+    attach_view = attachments[
+        (attachments["module"] == module)
+        & (attachments["ref_id"] == selected_id)
+    ]
+
+    if attach_view.empty:
+        st.info("目前沒有附件。")
+        return
+
+    for _, row in attach_view.iterrows():
+        st.markdown(f"**{row['title']}**  （{row['file_name']}）")
+        _preview_file(row["file_path"], row["file_type"])
+        if row["note"]:
+            st.caption(row["note"])
+
+        if st.button(
+            f"刪除此附件（ID {int(row['id'])}）",
+            key=f"del_attach_{module}_{int(row['id'])}",
+        ):
+            attachments = attachments[attachments["id"] != row["id"]]
+            save_csv("attachments.csv", attachments)
+            st.warning("附件已刪除")
+            st.experimental_rerun()
+
+        st.divider()
+
+
+# ========================
+# 頁面 1：案場素材拍攝管理
+# ========================
+
+def page_shooting_materials():
+    st.header("1. 案場素材拍攝管理")
+
+    sites = load_csv(
+        "shooting_sites.csv",
+        ["id", "site_name", "address", "status", "visit_datetime", "note"],
+    )
+    assets = load_csv(
+        "assets.csv",
+        ["id", "site_id", "file_name", "file_path", "file_type", "uploaded_at", "note"],
+    )
+
+    # 新增案場
+    st.subheader("新增案場")
+    with st.form("site_form", clear_on_submit=True):
+        site_name = st.text_input("案場名稱")
+        address = st.text_input("地址")
+        status = st.selectbox(
+            "狀態",
+            ["尚未勘景", "已勘景", "已拍攝", "待補拍"],
+        )
+        visit_date = st.date_input("預計 / 實際到場日期", value=date.today())
+        visit_time = st.time_input("時間", value=time(9, 0))
+        note = st.text_area("備註", height=80)
+        submitted = st.form_submit_button("新增案場")
+
+        if submitted:
+            if not site_name:
+                st.error("請輸入案場名稱")
+            else:
+                new_id = int(sites["id"].max()) + 1 if len(sites) > 0 else 1
+                visit_dt = datetime.combine(visit_date, visit_time)
+                new_row = {
+                    "id": new_id,
+                    "site_name": site_name,
+                    "address": address,
+                    "status": status,
+                    "visit_datetime": visit_dt.isoformat(),
+                    "note": note,
+                }
+                sites = pd.concat([sites, pd.DataFrame([new_row])], ignore_index=True)
+                save_csv("shooting_sites.csv", sites)
+                st.success("案場已新增")
+
+    # 案場列表與單筆編輯
+    st.subheader("案場列表")
+    if sites.empty:
+        st.info("目前沒有案場資料")
+    else:
+        st.dataframe(sites)
+
+        st.markdown("#### 編輯 / 刪除案場")
+        site_map = {f"{row['site_name']} (ID: {int(row['id'])})": int(row["id"])
+                    for _, row in sites.iterrows()}
+        selected_label = st.selectbox(
+            "選擇要編輯的案場",
+            list(site_map.keys()),
+            key="edit_site_select",
+        )
+        selected_id = site_map[selected_label]
+        row = sites[sites["id"] == selected_id].iloc[0]
+
+        with st.form("edit_site_form"):
+            site_name_ed = st.text_input("案場名稱", value=row["site_name"])
+            address_ed = st.text_input("地址", value=row["address"])
+            status_ed = st.selectbox(
+                "狀態",
+                ["尚未勘景", "已勘景", "已拍攝", "待補拍"],
+                index=["尚未勘景", "已勘景", "已拍攝", "待補拍"].index(row["status"])
+                if row["status"] in ["尚未勘景", "已勘景", "已拍攝", "待補拍"]
+                else 0,
+            )
+            try:
+                visit_dt = datetime.fromisoformat(str(row["visit_datetime"]))
+                visit_date_ed = st.date_input("日期", value=visit_dt.date())
+                visit_time_ed = st.time_input("時間", value=visit_dt.time())
+            except Exception:
+                visit_date_ed = st.date_input("日期", value=date.today())
+                visit_time_ed = st.time_input("時間", value=time(9, 0))
+            note_ed = st.text_area("備註", value=row["note"], height=80)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                update_btn = st.form_submit_button("儲存修改")
+            with col2:
+                delete_btn = st.form_submit_button("刪除此案場")
+
+            if update_btn:
+                idx = sites.index[sites["id"] == selected_id][0]
+                sites.at[idx, "site_name"] = site_name_ed
+                sites.at[idx, "address"] = address_ed
+                sites.at[idx, "status"] = status_ed
+                sites.at[idx, "visit_datetime"] = datetime.combine(
+                    visit_date_ed, visit_time_ed
+                ).isoformat()
+                sites.at[idx, "note"] = note_ed
+                save_csv("shooting_sites.csv", sites)
+                st.success("案場已更新")
+
+            if delete_btn:
+                # 同時刪除該案場的素材紀錄
+                sites = sites[sites["id"] != selected_id]
+                assets = assets[assets["site_id"] != selected_id]
+                save_csv("shooting_sites.csv", sites)
+                save_csv("assets.csv", assets)
+                st.warning("案場與其素材已刪除")
+                st.experimental_rerun()
+
+    # 素材上傳與預覽
+    st.markdown("---")
+    st.subheader("素材上傳與預覽（影像檔）")
+    if sites.empty:
+        st.info("請先新增案場")
+    else:
+        site_map2 = {f"{row['site_name']} (ID: {int(row['id'])})": int(row["id"])
+                     for _, row in sites.iterrows()}
+        selected_label2 = st.selectbox(
+            "選擇案場上傳素材",
+            list(site_map2.keys()),
+            key="asset_site_select",
+        )
+        selected_site_id = site_map2[selected_label2]
+
+        uploaded_files = st.file_uploader(
+            "上傳素材（圖片/影片，可多選）",
+            accept_multiple_files=True,
+            type=None,
+            key="asset_uploader",
+        )
+        note_assets = st.text_input("共用備註（選填）", key="asset_note")
+
+        if st.button("上傳素材"):
+            if not uploaded_files:
+                st.info("尚未選擇檔案")
+            else:
+                for f in uploaded_files:
+                    ASSETS_DIR.mkdir(exist_ok=True)
+                    file_path = ASSETS_DIR / f.name
+                    with open(file_path, "wb") as out:
+                        out.write(f.getbuffer())
+
+                    new_id = int(assets["id"].max()) + 1 if len(assets) > 0 else 1
+                    file_type = _simple_type_from_mime(f.type)
+                    new_row = {
+                        "id": new_id,
+                        "site_id": selected_site_id,
+                        "file_name": f.name,
+                        "file_path": str(file_path),
+                        "file_type": file_type,
+                        "uploaded_at": datetime.now().isoformat(),
+                        "note": note_assets,
+                    }
+                    assets = pd.concat(
+                        [assets, pd.DataFrame([new_row])],
+                        ignore_index=True,
+                    )
+                save_csv("assets.csv", assets)
+                st.success("素材已上傳")
+
+        st.markdown("#### 該案場素材預覽")
+        site_assets = assets[assets["site_id"] == selected_site_id]
+        if site_assets.empty:
+            st.info("尚無素材")
+        else:
+            for _, row in site_assets.iterrows():
+                st.write(f"檔名：{row['file_name']}")
+                _preview_file(row["file_path"], row["file_type"])
+                if row["note"]:
+                    st.caption(row["note"])
+                if st.button(
+                    f"刪除此素材（ID {int(row['id'])}）",
+                    key=f"del_asset_{int(row['id'])}",
+                ):
+                    assets = assets[assets["id"] != row["id"]]
+                    save_csv("assets.csv", assets)
+                    st.warning("素材已刪除")
+                    st.experimental_rerun()
+                st.divider()
+
+    # 通用附件（例如場地合約、平面圖…）
+    st.markdown("---")
+    attachment_section(
+        module="site",
+        ref_df=sites,
+        ref_label_col="site_name",
+        ref_id_col="id",
+    )
+
+
+# ========================
+# 頁面 2：訪談腳本 & 分鏡
+# ========================
+
+def page_scripts_storyboard():
+    st.header("2. 訪談腳本 & 分鏡設計")
+
+    scripts = load_csv(
+        "scripts.csv",
+        ["id", "category", "title", "content", "version", "is_approved", "updated_at"],
+    )
+    storyboards = load_csv(
+        "storyboards.csv",
+        ["id", "script_id", "shot_no", "description", "image_path", "note"],
+    )
+
+    tab1, tab2, tab3 = st.tabs(["訪談腳本管理", "分鏡設計", "分鏡列表與編輯"])
+
+    # --- 訪談腳本管理 ---
+    with tab1:
+        st.subheader("新增腳本")
+        with st.form("script_form", clear_on_submit=True):
+            category = st.text_input("腳本分類（例：老闆訪談 / 工廠導覽）")
+            title = st.text_input("腳本標題")
+            content = st.text_area("腳本內容（可條列/訪綱/完整稿）", height=200)
+            version = st.text_input("版本號", value="v1.0")
+            is_approved = st.checkbox("是否為確認版（凍結）", value=False)
+            submitted = st.form_submit_button("新增腳本")
+
+            if submitted:
+                if not title:
+                    st.error("請輸入腳本標題")
+                else:
+                    new_id = int(scripts["id"].max()) + 1 if len(scripts) > 0 else 1
+                    new_row = {
+                        "id": new_id,
+                        "category": category,
+                        "title": title,
+                        "content": content,
+                        "version": version,
+                        "is_approved": is_approved,
+                        "updated_at": datetime.now().isoformat(),
+                    }
+                    scripts = pd.concat(
+                        [scripts, pd.DataFrame([new_row])],
+                        ignore_index=True,
+                    )
+                    save_csv("scripts.csv", scripts)
+                    st.success("腳本已新增")
+
+        st.subheader("腳本列表")
+        if scripts.empty:
+            st.info("尚無腳本")
+        else:
+            st.dataframe(scripts)
+
+            st.markdown("#### 編輯 / 刪除腳本")
+            script_map = {
+                f"{row['title']} (ID: {int(row['id'])})": int(row["id"])
+                for _, row in scripts.iterrows()
+            }
+            selected_label = st.selectbox(
+                "選擇要編輯的腳本",
+                list(script_map.keys()),
+                key="edit_script_select",
+            )
+            selected_id = script_map[selected_label]
+            row = scripts[scripts["id"] == selected_id].iloc[0]
+
+            with st.form("edit_script_form"):
+                category_ed = st.text_input(
+                    "分類",
+                    value=row["category"],
+                )
+                title_ed = st.text_input("標題", value=row["title"])
+                content_ed = st.text_area(
+                    "內容",
+                    value=row["content"],
+                    height=200,
+                )
+                version_ed = st.text_input("版本", value=row["version"])
+                is_approved_ed = st.checkbox(
+                    "確認版",
+                    value=bool(row["is_approved"]),
+                )
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    update_btn = st.form_submit_button("儲存修改")
+                with col2:
+                    delete_btn = st.form_submit_button("刪除此腳本")
+
+                if update_btn:
+                    idx = scripts.index[scripts["id"] == selected_id][0]
+                    scripts.at[idx, "category"] = category_ed
+                    scripts.at[idx, "title"] = title_ed
+                    scripts.at[idx, "content"] = content_ed
+                    scripts.at[idx, "version"] = version_ed
+                    scripts.at[idx, "is_approved"] = is_approved_ed
+                    scripts.at[idx, "updated_at"] = datetime.now().isoformat()
+                    save_csv("scripts.csv", scripts)
+                    st.success("腳本已更新")
+
+                if delete_btn:
+                    # 連同刪除相關分鏡
+                    scripts = scripts[scripts["id"] != selected_id]
+                    storyboards = storyboards[storyboards["script_id"] != selected_id]
+                    save_csv("scripts.csv", scripts)
+                    save_csv("storyboards.csv", storyboards)
+                    st.warning("腳本與相關分鏡已刪除")
+                    st.experimental_rerun()
+
+        # 腳本附件（Word/PDF 等）
+        st.markdown("---")
+        if not scripts.empty:
+            attachment_section(
+                module="script",
+                ref_df=scripts,
+                ref_label_col="title",
+                ref_id_col="id",
+            )
+
+    # --- 分鏡新增 ---
+    with tab2:
+        st.subheader("新增分鏡")
+        if scripts.empty:
+            st.info("請先新增至少一個腳本")
+        else:
+            script_map2 = {
+                f"{row['title']} (ID: {int(row['id'])})": int(row["id"])
+                for _, row in scripts.iterrows()
+            }
+            selected_label2 = st.selectbox(
+                "選擇腳本",
+                list(script_map2.keys()),
+                key="sb_script_select",
+            )
+            selected_script_id = script_map2[selected_label2]
+
+            with st.form("storyboard_form", clear_on_submit=True):
+                shot_no = st.text_input("鏡號", value="1A")
+                description = st.text_area("分鏡描述（景別 / 運鏡 / 內容）")
+                image_file = st.file_uploader(
+                    "上傳分鏡圖片（選填）",
+                    type=["png", "jpg", "jpeg"],
+                )
+                note = st.text_input("備註", value="")
+                submitted = st.form_submit_button("新增分鏡")
+
+                if submitted:
+                    image_path = ""
+                    if image_file:
+                        sb_dir = ASSETS_DIR / "storyboards"
+                        sb_dir.mkdir(parents=True, exist_ok=True)
+                        file_path = sb_dir / image_file.name
+                        with open(file_path, "wb") as out:
+                            out.write(image_file.getbuffer())
+                        image_path = str(file_path)
+
+                    new_id = (
+                        int(storyboards["id"].max()) + 1
+                        if len(storyboards) > 0
+                        else 1
+                    )
+                    new_row = {
+                        "id": new_id,
+                        "script_id": selected_script_id,
+                        "shot_no": shot_no,
+                        "description": description,
+                        "image_path": image_path,
+                        "note": note,
+                    }
+                    storyboards = pd.concat(
+                        [storyboards, pd.DataFrame([new_row])],
+                        ignore_index=True,
+                    )
+                    save_csv("storyboards.csv", storyboards)
+                    st.success("分鏡已新增")
+
+    # --- 分鏡列表與編輯 ---
+    with tab3:
+        st.subheader("分鏡列表")
+        if storyboards.empty:
+            st.info("尚無分鏡")
+        else:
+            st.dataframe(storyboards)
+
+            st.markdown("#### 編輯 / 刪除分鏡")
+            label_map = {}
+            for _, row in storyboards.iterrows():
+                label = f"腳本ID {int(row['script_id'])} - 鏡號 {row['shot_no']} (ID: {int(row['id'])})"
+                label_map[label] = int(row["id"])
+
+            selected_label3 = st.selectbox(
+                "選擇要編輯的分鏡",
+                list(label_map.keys()),
+                key="edit_sb_select",
+            )
+            selected_sb_id = label_map[selected_label3]
+            row = storyboards[storyboards["id"] == selected_sb_id].iloc[0]
+
+            with st.form("edit_sb_form"):
+                shot_no_ed = st.text_input("鏡號", value=row["shot_no"])
+                description_ed = st.text_area(
+                    "分鏡描述",
+                    value=row["description"],
+                    height=120,
+                )
+                note_ed = st.text_input("備註", value=row["note"])
+                col1, col2 = st.columns(2)
+                with col1:
+                    update_btn = st.form_submit_button("儲存修改")
+                with col2:
+                    delete_btn = st.form_submit_button("刪除此分鏡")
+
+                if update_btn:
+                    idx = storyboards.index[storyboards["id"] == selected_sb_id][0]
+                    storyboards.at[idx, "shot_no"] = shot_no_ed
+                    storyboards.at[idx, "description"] = description_ed
+                    storyboards.at[idx, "note"] = note_ed
+                    save_csv("storyboards.csv", storyboards)
+                    st.success("分鏡已更新")
+
+                if delete_btn:
+                    storyboards = storyboards[storyboards["id"] != selected_sb_id]
+                    save_csv("storyboards.csv", storyboards)
+                    st.warning("分鏡已刪除")
+                    st.experimental_rerun()
+
+            # 分鏡附件（例如 PSD/參考影片等）
+            st.markdown("---")
+            attachment_section(
+                module="storyboard",
+                ref_df=storyboards,
+                ref_label_col="shot_no",
+                ref_id_col="id",
+            )
+
+
+# ========================
+# 頁面 3：部門 / 工班資訊
+# ========================
+
+def page_departments():
+    st.header("3. 部門 / 工班資訊管理")
+
+    df = load_csv(
+        "departments.csv",
+        ["id", "dept_type", "name", "role", "contact", "note"],
+    )
+
+    st.subheader("新增部門 / 工班")
+    with st.form("dept_form", clear_on_submit=True):
+        dept_type = st.text_input("部門類型（美術 / 燈光 / 攝影 / 收音 / 後製 / 客戶窗口 等）")
+        name = st.text_input("名稱（人名或公司）")
+        role = st.text_input("角色描述（例：主攝影 / 燈光師 / 副導）")
+        contact = st.text_input("聯絡方式（電話 / Line / Email）")
+        note = st.text_area("備註", height=80)
+        submitted = st.form_submit_button("新增")
+
+        if submitted:
+            if not name:
+                st.error("請輸入名稱")
+            else:
+                new_id = int(df["id"].max()) + 1 if len(df) > 0 else 1
+                new_row = {
+                    "id": new_id,
+                    "dept_type": dept_type,
+                    "name": name,
+                    "role": role,
+                    "contact": contact,
+                    "note": note,
+                }
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                save_csv("departments.csv", df)
+                st.success("已新增部門 / 工班")
+
+    st.subheader("部門 / 工班列表")
+    if df.empty:
+        st.info("尚無工班資料")
+    else:
+        st.dataframe(df)
+
+        st.markdown("#### 編輯 / 刪除部門 / 工班")
+        dept_map = {
+            f"{row['name']} (ID: {int(row['id'])})": int(row["id"])
+            for _, row in df.iterrows()
+        }
+        selected_label = st.selectbox(
+            "選擇要編輯的項目",
+            list(dept_map.keys()),
+            key="edit_dept_select",
+        )
+        selected_id = dept_map[selected_label]
+        row = df[df["id"] == selected_id].iloc[0]
+
+        with st.form("edit_dept_form"):
+            dept_type_ed = st.text_input("部門類型", value=row["dept_type"])
+            name_ed = st.text_input("名稱", value=row["name"])
+            role_ed = st.text_input("角色描述", value=row["role"])
+            contact_ed = st.text_input("聯絡方式", value=row["contact"])
+            note_ed = st.text_area("備註", value=row["note"], height=80)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                update_btn = st.form_submit_button("儲存修改")
+            with col2:
+                delete_btn = st.form_submit_button("刪除此項目")
+
+            if update_btn:
+                idx = df.index[df["id"] == selected_id][0]
+                df.at[idx, "dept_type"] = dept_type_ed
+                df.at[idx, "name"] = name_ed
+                df.at[idx, "role"] = role_ed
+                df.at[idx, "contact"] = contact_ed
+                df.at[idx, "note"] = note_ed
+                save_csv("departments.csv", df)
+                st.success("資料已更新")
+
+            if delete_btn:
+                df = df[df["id"] != selected_id]
+                save_csv("departments.csv", df)
+                st.warning("資料已刪除")
+                st.experimental_rerun()
+
+    # 工班附件（作品集、合約、spec 等）
+    st.markdown("---")
+    attachment_section(
+        module="department",
+        ref_df=df,
+        ref_label_col="name",
+        ref_id_col="id",
+    )
+
+
+# ========================
+# 頁面 4：拍攝流程 & 餐食管理
+# ========================
+
+def page_shooting_schedule():
+    st.header("4. 拍攝時間流程 & 人員餐食管理")
+
+    schedules = load_csv(
+        "schedules.csv",
+        [
+            "id",
+            "date",
+            "start_time",
+            "end_time",
+            "location",
+            "scene_desc",
+            "responsible",
+            "note",
+        ],
+    )
+    meals = load_csv(
+        "meals.csv",
+        ["id", "date", "meal_type", "time", "people", "vendor", "note"],
+    )
+
+    tab1, tab2 = st.tabs(["拍攝流程", "餐食管理"])
+
+    # --- 拍攝流程 ---
+    with tab1:
+        st.subheader("新增拍攝時段")
+        with st.form("schedule_form", clear_on_submit=True):
+            date_val = st.date_input("日期", value=date.today())
+            start_time = st.time_input("開始時間", value=time(9, 0))
+            end_time = st.time_input("結束時間", value=time(10, 0))
+            location = st.text_input("地點 / 場景")
+            scene_desc = st.text_area("內容描述（要拍什麼）", height=80)
+            responsible = st.text_input("負責人（導演 / 製片 / 客戶窗口等）")
+            note = st.text_input("備註", value="")
+            submitted = st.form_submit_button("新增拍攝時段")
+
+            if submitted:
+                new_id = int(schedules["id"].max()) + 1 if len(schedules) > 0 else 1
+                new_row = {
+                    "id": new_id,
+                    "date": date_val.isoformat(),
+                    "start_time": start_time.isoformat(),
+                    "end_time": end_time.isoformat(),
+                    "location": location,
+                    "scene_desc": scene_desc,
+                    "responsible": responsible,
+                    "note": note,
+                }
+                schedules = pd.concat(
+                    [schedules, pd.DataFrame([new_row])],
+                    ignore_index=True,
+                )
+                save_csv("schedules.csv", schedules)
+                st.success("拍攝時段已新增")
+
+        st.subheader("拍攝流程列表")
+        if schedules.empty:
+            st.info("尚無拍攝流程資料")
+        else:
+            df_view = schedules.copy()
+            # 轉換排序用
+            try:
+                df_view["date_dt"] = pd.to_datetime(df_view["date"])
+                df_view["start_dt"] = pd.to_datetime(df_view["start_time"])
+                df_view = df_view.sort_values(by=["date_dt", "start_dt"])
+            except Exception:
+                pass
+            st.dataframe(df_view.drop(columns=[c for c in df_view.columns if c.endswith("_dt")]))
+
+            st.markdown("#### 編輯 / 刪除拍攝時段")
+            sch_map = {
+                f"{row['date']} {row['location']} (ID: {int(row['id'])})": int(row["id"])
+                for _, row in schedules.iterrows()
+            }
+            selected_label = st.selectbox(
+                "選擇要編輯的時段",
+                list(sch_map.keys()),
+                key="edit_schedule_select",
+            )
+            selected_id = sch_map[selected_label]
+            row = schedules[schedules["id"] == selected_id].iloc[0]
+
+            # 從字串轉回 date/time
+            try:
+                date_ed = datetime.fromisoformat(str(row["date"])).date()
+            except Exception:
+                date_ed = date.today()
+            try:
+                start_time_ed = datetime.fromisoformat(str(row["start_time"])).time()
+            except Exception:
+                start_time_ed = time(9, 0)
+            try:
+                end_time_ed = datetime.fromisoformat(str(row["end_time"])).time()
+            except Exception:
+                end_time_ed = time(10, 0)
+
+            with st.form("edit_schedule_form"):
+                date_form = st.date_input("日期", value=date_ed)
+                start_time_form = st.time_input("開始時間", value=start_time_ed)
+                end_time_form = st.time_input("結束時間", value=end_time_ed)
+                location_ed = st.text_input("地點 / 場景", value=row["location"])
+                scene_desc_ed = st.text_area(
+                    "內容描述",
+                    value=row["scene_desc"],
+                    height=80,
+                )
+                responsible_ed = st.text_input("負責人", value=row["responsible"])
+                note_ed = st.text_input("備註", value=row["note"])
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    update_btn = st.form_submit_button("儲存修改")
+                with col2:
+                    delete_btn = st.form_submit_button("刪除此時段")
+
+                if update_btn:
+                    idx = schedules.index[schedules["id"] == selected_id][0]
+                    schedules.at[idx, "date"] = date_form.isoformat()
+                    schedules.at[idx, "start_time"] = start_time_form.isoformat()
+                    schedules.at[idx, "end_time"] = end_time_form.isoformat()
+                    schedules.at[idx, "location"] = location_ed
+                    schedules.at[idx, "scene_desc"] = scene_desc_ed
+                    schedules.at[idx, "responsible"] = responsible_ed
+                    schedules.at[idx, "note"] = note_ed
+                    save_csv("schedules.csv", schedules)
+                    st.success("拍攝時段已更新")
+
+                if delete_btn:
+                    schedules = schedules[schedules["id"] != selected_id]
+                    save_csv("schedules.csv", schedules)
+                    st.warning("時段已刪除")
+                    st.experimental_rerun()
+
+        # 拍攝流程附件（Call Sheet PDF 等）
+        st.markdown("---")
+        attachment_section(
+            module="schedule",
+            ref_df=schedules,
+            ref_label_col="scene_desc",
+            ref_id_col="id",
+        )
+
+    # --- 餐食管理 ---
+    with tab2:
+        st.subheader("新增餐食安排")
+        with st.form("meal_form", clear_on_submit=True):
+            date_val = st.date_input("日期", value=date.today(), key="meal_date")
+            meal_type = st.selectbox(
+                "餐別",
+                ["早餐", "午餐", "晚餐", "消夜"],
+            )
+            time_val = st.time_input("用餐時間", value=time(12, 0))
+            people = st.text_input("用餐人員（文字或人數說明）")
+            vendor = st.text_input("餐廠 / 外送來源")
+            note = st.text_input("備註", value="")
+            submitted = st.form_submit_button("新增餐食安排")
+
+            if submitted:
+                new_id = int(meals["id"].max()) + 1 if len(meals) > 0 else 1
+                new_row = {
+                    "id": new_id,
+                    "date": date_val.isoformat(),
+                    "meal_type": meal_type,
+                    "time": time_val.isoformat(),
+                    "people": people,
+                    "vendor": vendor,
+                    "note": note,
+                }
+                meals = pd.concat(
+                    [meals, pd.DataFrame([new_row])],
+                    ignore_index=True,
+                )
+                save_csv("meals.csv", meals)
+                st.success("餐食安排已新增")
+
+        st.subheader("餐食安排列表")
+        if meals.empty:
+            st.info("尚無餐食資料")
+        else:
+            df_view = meals.copy()
+            try:
+                df_view["date_dt"] = pd.to_datetime(df_view["date"])
+                df_view["time_dt"] = pd.to_datetime(df_view["time"])
+                df_view = df_view.sort_values(by=["date_dt", "time_dt"])
+            except Exception:
+                pass
+            st.dataframe(df_view.drop(columns=[c for c in df_view.columns if c.endswith("_dt")]))
+
+            st.markdown("#### 編輯 / 刪除餐食安排")
+            meal_map = {
+                f"{row['date']} {row['meal_type']} (ID: {int(row['id'])})": int(row["id"])
+                for _, row in meals.iterrows()
+            }
+            selected_label = st.selectbox(
+                "選擇要編輯的餐食安排",
+                list(meal_map.keys()),
+                key="edit_meal_select",
+            )
+            selected_id = meal_map[selected_label]
+            row = meals[meals["id"] == selected_id].iloc[0]
+
+            try:
+                date_ed = datetime.fromisoformat(str(row["date"])).date()
+            except Exception:
+                date_ed = date.today()
+            try:
+                time_ed = datetime.fromisoformat(str(row["time"])).time()
+            except Exception:
+                time_ed = time(12, 0)
+
+            with st.form("edit_meal_form"):
+                date_form = st.date_input("日期", value=date_ed)
+                meal_type_ed = st.selectbox(
+                    "餐別",
+                    ["早餐", "午餐", "晚餐", "消夜"],
+                    index=["早餐", "午餐", "晚餐", "消夜"].index(row["meal_type"])
+                    if row["meal_type"] in ["早餐", "午餐", "晚餐", "消夜"]
+                    else 1,
+                )
+                time_form = st.time_input("用餐時間", value=time_ed)
+                people_ed = st.text_input("用餐人員", value=row["people"])
+                vendor_ed = st.text_input("餐廠 / 外送來源", value=row["vendor"])
+                note_ed = st.text_input("備註", value=row["note"])
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    update_btn = st.form_submit_button("儲存修改")
+                with col2:
+                    delete_btn = st.form_submit_button("刪除此安排")
+
+                if update_btn:
+                    idx = meals.index[meals["id"] == selected_id][0]
+                    meals.at[idx, "date"] = date_form.isoformat()
+                    meals.at[idx, "meal_type"] = meal_type_ed
+                    meals.at[idx, "time"] = time_form.isoformat()
+                    meals.at[idx, "people"] = people_ed
+                    meals.at[idx, "vendor"] = vendor_ed
+                    meals.at[idx, "note"] = note_ed
+                    save_csv("meals.csv", meals)
+                    st.success("餐食安排已更新")
+
+                if delete_btn:
+                    meals = meals[meals["id"] != selected_id]
+                    save_csv("meals.csv", meals)
+                    st.warning("餐食安排已刪除")
+                    st.experimental_rerun()
+
+        # 餐食附件（菜單、對帳單等，如需要）
+        st.markdown("---")
+        attachment_section(
+            module="meal",
+            ref_df=meals,
+            ref_label_col="meal_type",
+            ref_id_col="id",
+        )
+
+
+# ========================
+# 頁面 5：剪輯進度管理
+# ========================
+
+def page_editing_progress():
+    st.header("5. 剪輯進度管理")
+
+    df = load_csv(
+        "editing_tasks.csv",
+        [
+            "id",
+            "clip_name",
+            "type",
+            "editor",
+            "status",
+            "version",
+            "last_update",
+            "note",
+        ],
+    )
+
+    st.subheader("新增剪輯任務")
+    with st.form("edit_task_form", clear_on_submit=True):
+        clip_name = st.text_input("剪輯項目名稱（例：主片 90s / Reels_01）")
+        clip_type = st.selectbox(
+            "類型",
+            ["正片", "短版剪輯", "直式剪輯", "預告片", "其他"],
+        )
+        editor = st.text_input("剪輯師")
+        status = st.selectbox(
+            "狀態",
+            ["未開始", "粗剪中", "粗剪完成", "精剪中", "客戶審稿", "已定稿"],
+        )
+        version = st.text_input("版本", value="v0.1")
+        note = st.text_area("備註 / 回饋重點", height=80)
+        submitted = st.form_submit_button("新增剪輯任務")
+
+        if submitted:
+            if not clip_name:
+                st.error("請輸入剪輯項目名稱")
+            else:
+                new_id = int(df["id"].max()) + 1 if len(df) > 0 else 1
+                new_row = {
+                    "id": new_id,
+                    "clip_name": clip_name,
+                    "type": clip_type,
+                    "editor": editor,
+                    "status": status,
+                    "version": version,
+                    "last_update": datetime.now().isoformat(),
+                    "note": note,
+                }
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                save_csv("editing_tasks.csv", df)
+                st.success("剪輯任務已新增")
+
+    st.subheader("剪輯任務列表")
+    if df.empty:
+        st.info("尚無剪輯任務")
+    else:
+        st.dataframe(df)
+
+        st.markdown("#### 編輯 / 刪除剪輯任務")
+        task_map = {
+            f"{row['clip_name']} (ID: {int(row['id'])})": int(row["id"])
+            for _, row in df.iterrows()
+        }
+        selected_label = st.selectbox(
+            "選擇要編輯的剪輯任務",
+            list(task_map.keys()),
+            key="edit_task_select",
+        )
+        selected_id = task_map[selected_label]
+        row = df[df["id"] == selected_id].iloc[0]
+
+        with st.form("edit_task_form2"):
+            clip_name_ed = st.text_input("剪輯項目名稱", value=row["clip_name"])
+            clip_type_ed = st.selectbox(
+                "類型",
+                ["正片", "短版剪輯", "直式剪輯", "預告片", "其他"],
+                index=["正片", "短版剪輯", "直式剪輯", "預告片", "其他"].index(
+                    row["type"]
+                )
+                if row["type"] in ["正片", "短版剪輯", "直式剪輯", "預告片", "其他"]
+                else 0,
+            )
+            editor_ed = st.text_input("剪輯師", value=row["editor"])
+            status_ed = st.selectbox(
+                "狀態",
+                ["未開始", "粗剪中", "粗剪完成", "精剪中", "客戶審稿", "已定稿"],
+                index=["未開始", "粗剪中", "粗剪完成", "精剪中", "客戶審稿", "已定稿"].index(
+                    row["status"]
+                )
+                if row["status"]
+                in ["未開始", "粗剪中", "粗剪完成", "精剪中", "客戶審稿", "已定稿"]
+                else 0,
+            )
+            version_ed = st.text_input("版本", value=row["version"])
+            note_ed = st.text_area("備註 / 回饋重點", value=row["note"], height=80)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                update_btn = st.form_submit_button("儲存修改")
+            with col2:
+                delete_btn = st.form_submit_button("刪除此任務")
+
+            if update_btn:
+                idx = df.index[df["id"] == selected_id][0]
+                df.at[idx, "clip_name"] = clip_name_ed
+                df.at[idx, "type"] = clip_type_ed
+                df.at[idx, "editor"] = editor_ed
+                df.at[idx, "status"] = status_ed
+                df.at[idx, "version"] = version_ed
+                df.at[idx, "note"] = note_ed
+                df.at[idx, "last_update"] = datetime.now().isoformat()
+                save_csv("editing_tasks.csv", df)
+                st.success("剪輯任務已更新")
+
+            if delete_btn:
+                df = df[df["id"] != selected_id]
+                save_csv("editing_tasks.csv", df)
+                st.warning("剪輯任務已刪除")
+                st.experimental_rerun()
+
+    # 剪輯任務附件（回饋截圖、特殊素材說明等）
+    st.markdown("---")
+    attachment_section(
+        module="editing",
+        ref_df=df,
+        ref_label_col="clip_name",
+        ref_id_col="id",
+    )
+
+
+# ========================
+# 主程式入口（卡片式側邊欄）
+# ========================
+
+def main():
+    st.set_page_config(
+        page_title="寶鴻 - 形象影片拍攝專案管理系統",
+        layout="wide",
+    )
+
+    # 全域 CSS（藍色卡片式側邊欄，使用 radio 不會 re-layout）
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] > div:first-child {
+            padding-top: 1rem;
+        }
+        .sidebar-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+        }
+        .sidebar-subtitle {
+            font-size: 0.8rem;
+            color: #5f6c80;
+            margin-bottom: 1rem;
+        }
+
+        /* 把 radio 改成卡片樣式 */
+        .stRadio > div[role="radiogroup"] {
+            gap: 0.4rem !important;
+        }
+
+        .stRadio > div[role="radiogroup"] > label {
+            border-radius: 0.9rem;
+            padding: 0.55rem 0.9rem;
+            border: 1px solid #1e88e5;
+            background-color: #e3f2fd;
+            color: #1565c0;
+            font-size: 0.9rem;
+            font-weight: 500;
+            width: 100%;
+            display: flex;
+            align-items: center;
+            box-sizing: border-box;
+            cursor: pointer;
+            box-shadow: 0 0 0 rgba(0,0,0,0);
+        }
+
+        /* 隱藏原本的 radio 圓點 */
+        .stRadio > div[role="radiogroup"] > label > div:first-child {
+            display: none;
+        }
+
+        /* 文字容器靠左 */
+        .stRadio > div[role="radiogroup"] > label > div:nth-child(2) {
+            width: 100%;
+        }
+
+        /* hover 效果 */
+        .stRadio > div[role="radiogroup"] > label:hover {
+            background-color: #d0e7ff;
+            border-color: #1565c0;
+        }
+
+        /* 已選取（active）狀態：深藍漸層卡片，白字，陰影 */
+        .stRadio > div[role="radiogroup"] > label[data-checked="true"] {
+            border: 1px solid #1565c0;
+            background: linear-gradient(135deg, #1e88e5, #1565c0);
+            color: #ffffff;
+            font-weight: 600;
+            box-shadow: 0 2px 6px rgba(21, 101, 192, 0.3);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.markdown(
+            '<div class="sidebar-title">寶鴻 - 形象影片拍攝專案管理系統</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="sidebar-subtitle">選擇管理模組</div>',
+            unsafe_allow_html=True,
+        )
+
+        # radio 選單（用 emoji + 文案組成 label）
+        page_label = st.radio(
+            "選擇管理模組",
+            [
+                "📍 案場素材拍攝管理",
+                "📖 訪談腳本 & 分鏡設計",
+                "👥 部門 / 工班資訊管理",
+                "🗓️ 拍攝流程 & 餐食管理",
+                "🎬 剪輯進度管理",
+            ],
+            label_visibility="collapsed",
+        )
+
+    # 主畫面標題
+    st.title("寶鴻 - 形象影片拍攝專案管理系統")
+
+    # 根據 label 決定要顯示哪一頁
+    if page_label.startswith("📍"):
+        page_shooting_materials()
+    elif page_label.startswith("📖"):
+        page_scripts_storyboard()
+    elif page_label.startswith("👥"):
+        page_departments()
+    elif page_label.startswith("🗓️"):
+        page_shooting_schedule()
+    elif page_label.startswith("🎬"):
+        page_editing_progress()
+
+
+if __name__ == "__main__":
+    main()
